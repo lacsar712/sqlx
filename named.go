@@ -30,6 +30,33 @@ type NamedStmt struct {
 	Params      []string
 	QueryString string
 	Stmt        *Stmt
+	// scope, when non-nil, references the live named parameter staging scope
+	// in which this statement was prepared.  It is consulted on every
+	// Exec/Query; no staged value is ever copied into the statement, so
+	// concurrent executions can neither freeze a snapshot nor pollute each
+	// other.  nil for statements prepared outside of a scope.
+	scope namedStmtScope
+}
+
+// namedStager is implemented by an active named parameter staging scope.
+// lookupStaged resolves a name that the current call's own argument does not
+// carry, walking the innermost layer first and then committed outer layers.
+type namedStager interface {
+	lookupStaged(name string) (interface{}, bool)
+}
+
+// namedStmtScope is the part of a NamedScope used by NamedStmt while binding,
+// executing and staging the writes of a prepared named statement.
+type namedStmtScope interface {
+	namedStager
+	// active reports whether the scope is currently entered and usable.
+	active() bool
+	// stageArg merges the names carried by a successful call's argument
+	// (map, struct or slice thereof) into the scope's current layer.
+	stageArg(arg interface{})
+	// abort discards every write staged in the current layer; it is invoked
+	// on the Must* panic paths before the panic is re-raised.
+	abort()
 }
 
 // Close closes the named statement.
@@ -37,24 +64,59 @@ func (n *NamedStmt) Close() error {
 	return n.Stmt.Close()
 }
 
+// scopeInUse returns the live scope the statement must bind against, or nil
+// when the statement was prepared outside of a scope (or its scope has been
+// exited, in which case plain binding semantics apply again).
+func (n *NamedStmt) scopeInUse() namedStmtScope {
+	if n.scope != nil && n.scope.active() {
+		return n.scope
+	}
+	return nil
+}
+
+// bindStmtArgs expands the prepared parameter names against arg, overlaying
+// the live staging chain when the statement runs inside a scope.
+func (n *NamedStmt) bindStmtArgs(arg interface{}, sc namedStmtScope) ([]interface{}, error) {
+	if sc == nil {
+		return bindAnyArgs(n.Params, arg, n.Stmt.Mapper)
+	}
+	return bindAnyArgsStaged(n.Params, arg, n.Stmt.Mapper, sc)
+}
+
 // Exec executes a named statement using the struct passed.
 // Any named placeholder parameters are replaced with fields from arg.
 func (n *NamedStmt) Exec(arg interface{}) (sql.Result, error) {
-	args, err := bindAnyArgs(n.Params, arg, n.Stmt.Mapper)
+	sc := n.scopeInUse()
+	args, err := n.bindStmtArgs(arg, sc)
 	if err != nil {
 		return *new(sql.Result), err
 	}
-	return n.Stmt.Exec(args...)
+	res, err := n.Stmt.Exec(args...)
+	if err != nil {
+		return *new(sql.Result), err
+	}
+	if sc != nil {
+		sc.stageArg(arg)
+	}
+	return res, nil
 }
 
 // Query executes a named statement using the struct argument, returning rows.
 // Any named placeholder parameters are replaced with fields from arg.
 func (n *NamedStmt) Query(arg interface{}) (*sql.Rows, error) {
-	args, err := bindAnyArgs(n.Params, arg, n.Stmt.Mapper)
+	sc := n.scopeInUse()
+	args, err := n.bindStmtArgs(arg, sc)
 	if err != nil {
 		return nil, err
 	}
-	return n.Stmt.Query(args...)
+	rows, err := n.Stmt.Query(args...)
+	if err != nil {
+		return nil, err
+	}
+	if sc != nil {
+		sc.stageArg(arg)
+	}
+	return rows, nil
 }
 
 // QueryRow executes a named statement against the database.  Because sqlx cannot
@@ -62,9 +124,13 @@ func (n *NamedStmt) Query(arg interface{}) (*sql.Rows, error) {
 // returns a *sqlx.Row instead.
 // Any named placeholder parameters are replaced with fields from arg.
 func (n *NamedStmt) QueryRow(arg interface{}) *Row {
-	args, err := bindAnyArgs(n.Params, arg, n.Stmt.Mapper)
+	sc := n.scopeInUse()
+	args, err := n.bindStmtArgs(arg, sc)
 	if err != nil {
 		return &Row{err: err}
+	}
+	if sc != nil {
+		sc.stageArg(arg)
 	}
 	return n.Stmt.QueryRowx(args...)
 }
@@ -74,6 +140,9 @@ func (n *NamedStmt) QueryRow(arg interface{}) *Row {
 func (n *NamedStmt) MustExec(arg interface{}) sql.Result {
 	res, err := n.Exec(arg)
 	if err != nil {
+		if sc := n.scope; sc != nil {
+			sc.abort()
+		}
 		panic(err)
 	}
 	return res
@@ -117,7 +186,7 @@ func (n *NamedStmt) Get(dest interface{}, arg interface{}) error {
 
 // Unsafe creates an unsafe version of the NamedStmt
 func (n *NamedStmt) Unsafe() *NamedStmt {
-	r := &NamedStmt{Params: n.Params, Stmt: n.Stmt, QueryString: n.QueryString}
+	r := &NamedStmt{Params: n.Params, Stmt: n.Stmt, QueryString: n.QueryString, scope: n.scope}
 	r.Stmt.unsafe = true
 	return r
 }
@@ -161,16 +230,27 @@ func convertMapStringInterface(v interface{}) (map[string]interface{}, bool) {
 }
 
 func bindAnyArgs(names []string, arg interface{}, m *reflectx.Mapper) ([]interface{}, error) {
+	return bindAnyArgsStaged(names, arg, m, nil)
+}
+
+// bindAnyArgsStaged is bindAnyArgs with an optional staging layer: names not
+// carried by the call's own argument are resolved through the live scope
+// chain.  Map and struct arguments take the identical code path.
+func bindAnyArgsStaged(names []string, arg interface{}, m *reflectx.Mapper, st namedStager) ([]interface{}, error) {
 	if maparg, ok := convertMapStringInterface(arg); ok {
-		return bindMapArgs(names, maparg)
+		return bindMapArgsStaged(names, maparg, st)
 	}
-	return bindArgs(names, arg, m)
+	return bindArgsStaged(names, arg, m, st)
 }
 
 // private interface to generate a list of interfaces from a given struct
 // type, given a list of names to pull out of the struct.  Used by public
 // BindStruct interface.
 func bindArgs(names []string, arg interface{}, m *reflectx.Mapper) ([]interface{}, error) {
+	return bindArgsStaged(names, arg, m, nil)
+}
+
+func bindArgsStaged(names []string, arg interface{}, m *reflectx.Mapper, st namedStager) ([]interface{}, error) {
 	arglist := make([]interface{}, 0, len(names))
 
 	// grab the indirected value of arg
@@ -181,6 +261,14 @@ func bindArgs(names []string, arg interface{}, m *reflectx.Mapper) ([]interface{
 
 	err := m.TraversalsByNameFunc(v.Type(), names, func(i int, t []int) error {
 		if len(t) == 0 {
+			// the argument itself does not carry this name; fall back to the
+			// staging chain before reporting it missing
+			if st != nil {
+				if val, ok := st.lookupStaged(names[i]); ok {
+					arglist = append(arglist, val)
+					return nil
+				}
+			}
 			return fmt.Errorf("could not find name %s in %#v", names[i], arg)
 		}
 
@@ -195,14 +283,26 @@ func bindArgs(names []string, arg interface{}, m *reflectx.Mapper) ([]interface{
 
 // like bindArgs, but for maps.
 func bindMapArgs(names []string, arg map[string]interface{}) ([]interface{}, error) {
+	return bindMapArgsStaged(names, arg, nil)
+}
+
+func bindMapArgsStaged(names []string, arg map[string]interface{}, st namedStager) ([]interface{}, error) {
 	arglist := make([]interface{}, 0, len(names))
 
 	for _, name := range names {
-		val, ok := arg[name]
-		if !ok {
-			return arglist, fmt.Errorf("could not find name %s in %#v", name, arg)
+		if val, ok := arg[name]; ok {
+			arglist = append(arglist, val)
+			continue
 		}
-		arglist = append(arglist, val)
+		// a key the call did not carry may be supplied by a committed layer
+		// of the staging chain
+		if st != nil {
+			if val, ok := st.lookupStaged(name); ok {
+				arglist = append(arglist, val)
+				continue
+			}
+		}
+		return arglist, fmt.Errorf("could not find name %s in %#v", name, arg)
 	}
 	return arglist, nil
 }
@@ -211,12 +311,16 @@ func bindMapArgs(names []string, arg map[string]interface{}) ([]interface{}, err
 // The rules for binding field names to parameter names follow the same
 // conventions as for StructScan, including obeying the `db` struct tags.
 func bindStruct(bindType int, query string, arg interface{}, m *reflectx.Mapper) (string, []interface{}, error) {
+	return bindStructStaged(bindType, query, arg, m, nil)
+}
+
+func bindStructStaged(bindType int, query string, arg interface{}, m *reflectx.Mapper, st namedStager) (string, []interface{}, error) {
 	bound, names, err := compileNamedQuery([]byte(query), bindType)
 	if err != nil {
 		return "", []interface{}{}, err
 	}
 
-	arglist, err := bindAnyArgs(names, arg, m)
+	arglist, err := bindAnyArgsStaged(names, arg, m, st)
 	if err != nil {
 		return "", []interface{}{}, err
 	}
@@ -271,6 +375,10 @@ func fixBound(bound string, loop int) string {
 // bindArray binds a named parameter query with fields from an array or slice of
 // structs argument.
 func bindArray(bindType int, query string, arg interface{}, m *reflectx.Mapper) (string, []interface{}, error) {
+	return bindArrayStaged(bindType, query, arg, m, nil)
+}
+
+func bindArrayStaged(bindType int, query string, arg interface{}, m *reflectx.Mapper, st namedStager) (string, []interface{}, error) {
 	// do the initial binding with QUESTION;  if bindType is not question,
 	// we can rebind it at the end.
 	bound, names, err := compileNamedQuery([]byte(query), QUESTION)
@@ -284,7 +392,7 @@ func bindArray(bindType int, query string, arg interface{}, m *reflectx.Mapper) 
 	}
 	var arglist = make([]interface{}, 0, len(names)*arrayLen)
 	for i := 0; i < arrayLen; i++ {
-		elemArglist, err := bindAnyArgs(names, arrayValue.Index(i).Interface(), m)
+		elemArglist, err := bindAnyArgsStaged(names, arrayValue.Index(i).Interface(), m, st)
 		if err != nil {
 			return "", []interface{}{}, err
 		}
@@ -302,12 +410,16 @@ func bindArray(bindType int, query string, arg interface{}, m *reflectx.Mapper) 
 
 // bindMap binds a named parameter query with a map of arguments.
 func bindMap(bindType int, query string, args map[string]interface{}) (string, []interface{}, error) {
+	return bindMapStaged(bindType, query, args, nil)
+}
+
+func bindMapStaged(bindType int, query string, args map[string]interface{}, st namedStager) (string, []interface{}, error) {
 	bound, names, err := compileNamedQuery([]byte(query), bindType)
 	if err != nil {
 		return "", []interface{}{}, err
 	}
 
-	arglist, err := bindMapArgs(names, args)
+	arglist, err := bindMapArgsStaged(names, args, st)
 	return bound, arglist, err
 }
 
@@ -419,6 +531,12 @@ func Named(query string, arg interface{}) (string, []interface{}, error) {
 }
 
 func bindNamedMapper(bindType int, query string, arg interface{}, m *reflectx.Mapper) (string, []interface{}, error) {
+	return bindNamedMapperStaged(bindType, query, arg, m, nil)
+}
+
+// bindNamedMapperStaged is bindNamedMapper with an optional staging layer
+// consulted for names the call's own argument does not carry.
+func bindNamedMapperStaged(bindType int, query string, arg interface{}, m *reflectx.Mapper, st namedStager) (string, []interface{}, error) {
 	t := reflect.TypeOf(arg)
 	k := t.Kind()
 	switch {
@@ -427,11 +545,11 @@ func bindNamedMapper(bindType int, query string, arg interface{}, m *reflectx.Ma
 		if !ok {
 			return "", nil, fmt.Errorf("sqlx.bindNamedMapper: unsupported map type: %T", arg)
 		}
-		return bindMap(bindType, query, m)
+		return bindMapStaged(bindType, query, m, st)
 	case k == reflect.Array || k == reflect.Slice:
-		return bindArray(bindType, query, arg, m)
+		return bindArrayStaged(bindType, query, arg, m, st)
 	default:
-		return bindStruct(bindType, query, arg, m)
+		return bindStructStaged(bindType, query, arg, m, st)
 	}
 }
 

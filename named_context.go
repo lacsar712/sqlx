@@ -35,21 +35,37 @@ func prepareNamedContext(ctx context.Context, p namedPreparerContext, query stri
 // ExecContext executes a named statement using the struct passed.
 // Any named placeholder parameters are replaced with fields from arg.
 func (n *NamedStmt) ExecContext(ctx context.Context, arg interface{}) (sql.Result, error) {
-	args, err := bindAnyArgs(n.Params, arg, n.Stmt.Mapper)
+	sc := n.scopeInUse()
+	args, err := n.bindStmtArgs(arg, sc)
 	if err != nil {
 		return *new(sql.Result), err
 	}
-	return n.Stmt.ExecContext(ctx, args...)
+	res, err := n.Stmt.ExecContext(ctx, args...)
+	if err != nil {
+		return *new(sql.Result), err
+	}
+	if sc != nil {
+		sc.stageArg(arg)
+	}
+	return res, nil
 }
 
 // QueryContext executes a named statement using the struct argument, returning rows.
 // Any named placeholder parameters are replaced with fields from arg.
 func (n *NamedStmt) QueryContext(ctx context.Context, arg interface{}) (*sql.Rows, error) {
-	args, err := bindAnyArgs(n.Params, arg, n.Stmt.Mapper)
+	sc := n.scopeInUse()
+	args, err := n.bindStmtArgs(arg, sc)
 	if err != nil {
 		return nil, err
 	}
-	return n.Stmt.QueryContext(ctx, args...)
+	rows, err := n.Stmt.QueryContext(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	if sc != nil {
+		sc.stageArg(arg)
+	}
+	return rows, nil
 }
 
 // QueryRowContext executes a named statement against the database.  Because sqlx cannot
@@ -57,9 +73,13 @@ func (n *NamedStmt) QueryContext(ctx context.Context, arg interface{}) (*sql.Row
 // returns a *sqlx.Row instead.
 // Any named placeholder parameters are replaced with fields from arg.
 func (n *NamedStmt) QueryRowContext(ctx context.Context, arg interface{}) *Row {
-	args, err := bindAnyArgs(n.Params, arg, n.Stmt.Mapper)
+	sc := n.scopeInUse()
+	args, err := n.bindStmtArgs(arg, sc)
 	if err != nil {
 		return &Row{err: err}
+	}
+	if sc != nil {
+		sc.stageArg(arg)
 	}
 	return n.Stmt.QueryRowxContext(ctx, args...)
 }
@@ -69,6 +89,9 @@ func (n *NamedStmt) QueryRowContext(ctx context.Context, arg interface{}) *Row {
 func (n *NamedStmt) MustExecContext(ctx context.Context, arg interface{}) sql.Result {
 	res, err := n.ExecContext(ctx, arg)
 	if err != nil {
+		if sc := n.scope; sc != nil {
+			sc.abort()
+		}
 		panic(err)
 	}
 	return res
